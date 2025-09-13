@@ -162,16 +162,18 @@ void vanity_run(config &vanity) {
 		// Run on all GPUs
 		for (int g = 0; g < gpuCount; ++g) {
 			cudaSetDevice(g);
-			// Calculate Occupancy
-			int blockSize       = 0,
-			    minGridSize     = 0,
-			    maxActiveBlocks = 0;
-			cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
+			// Get device properties for RTX 5070 compatibility
+			cudaDeviceProp prop;
+			cudaGetDeviceProperties(&prop, g);
+			
+			// Use safe launch parameters for RTX 5070
+			int blockSize = 256; // Safe block size for all modern GPUs
+			int maxActiveBlocks = prop.multiProcessorCount * 2; // Conservative occupancy
 			
 			// Debug: Print kernel launch parameters on first iteration
 			if (i == 0) {
-				printf("GPU %d: Launching kernel with %d blocks, %d threads per block\n", g, maxActiveBlocks, blockSize);
+				printf("GPU %d (%s): Launching kernel with %d blocks, %d threads per block (SM count: %d)\n", 
+				       g, prop.name, maxActiveBlocks, blockSize, prop.multiProcessorCount);
 			}
 
 			int* dev_g;
