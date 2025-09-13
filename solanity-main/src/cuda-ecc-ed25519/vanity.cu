@@ -168,6 +168,11 @@ void vanity_run(config &vanity) {
 			    maxActiveBlocks = 0;
 			cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
 			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
+			
+			// Debug: Print kernel launch parameters on first iteration
+			if (i == 0) {
+				printf("GPU %d: Launching kernel with %d blocks, %d threads per block\n", g, maxActiveBlocks, blockSize);
+			}
 
 			int* dev_g;
 	                cudaMalloc((void**)&dev_g, sizeof(int));
@@ -175,8 +180,18 @@ void vanity_run(config &vanity) {
 
 	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));		
 	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));		
+	                
+	                // Initialize GPU memory to zero
+	                cudaMemset(dev_keys_found[g], 0, sizeof(int));
+	                cudaMemset(dev_executions_this_gpu[g], 0, sizeof(int));
 
 			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
+			
+			// Check for kernel launch errors
+			cudaError_t err = cudaGetLastError();
+			if (err != cudaSuccess) {
+				printf("GPU %d kernel launch failed: %s\n", g, cudaGetErrorString(err));
+			}
 
 		}
 
