@@ -15,9 +15,7 @@
 #include "fixedint.h"
 #include "gpu_common.h"
 #include "gpu_ctx.h"
-#include <cooperative_groups.h>
-
-namespace cg = cooperative_groups;
+// Using built-in warp primitives instead of cooperative_groups for compatibility
 
 #include "keypair.cu"
 #include "sc.cu"
@@ -521,8 +519,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 __device__ void warp_cooperative_b58enc(
 	char* b58_output,
-	uint8_t* data,
-	cg::thread_block_tile<32>& warp
+	uint8_t* data
 ) {
 	const char b58digits[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 	
@@ -551,19 +548,19 @@ __device__ void warp_cooperative_b58enc(
 	// Count leading zeros cooperatively
 	int zcount = 0;
 	int my_zero = (lane_id < 32 && bin[lane_id] == 0) ? 1 : 0;
-	uint32_t zero_mask = warp.ballot(my_zero);
+	uint32_t zero_mask = __ballot_sync(0xFFFFFFFF, my_zero);
 	if (lane_id == 0) {
 		zcount = __clz(__brev(zero_mask | (1u << 31))) - (32 - 32); // Count trailing zeros
 		if (zcount > 32) zcount = 32;
 	}
-	zcount = warp.shfl(zcount, 0);
+	zcount = __shfl_sync(0xFFFFFFFF, zcount, 0);
 	
 	// Parallel division algorithm
 	for (int i = zcount; i < 32; ++i) {
 		int carry = (lane_id == 0) ? bin[i] : 0;
 		
 		// Broadcast input byte to all threads
-		carry = warp.shfl(carry, 0);
+		carry = __shfl_sync(0xFFFFFFFF, carry, 0);
 		
 		// Each thread processes different positions
 		for (int pos = 44 - lane_id; pos >= 0; pos -= 32) {
@@ -573,10 +570,10 @@ __device__ void warp_cooperative_b58enc(
 				carry /= 58;
 			}
 		}
-		warp.sync();
+		__syncwarp();
 		
 		// Propagate carry values
-		int next_carry = warp.shfl_up(carry, 1);
+		int next_carry = __shfl_up_sync(0xFFFFFFFF, carry, 1);
 		if (lane_id > 0 && next_carry > 0) {
 			// Handle carry propagation
 			for (int pos = 44 - (lane_id - 1); pos >= 0; pos -= 32) {
@@ -587,7 +584,7 @@ __device__ void warp_cooperative_b58enc(
 				}
 			}
 		}
-		warp.sync();
+		__syncwarp();
 	}
 	
 	// Find first non-zero cooperatively  
@@ -596,11 +593,11 @@ __device__ void warp_cooperative_b58enc(
 	
 	// Reduce to find minimum
 	for (int offset = 16; offset > 0; offset /= 2) {
-		int other = warp.shfl_down(my_first, offset);
+		int other = __shfl_down_sync(0xFFFFFFFF, my_first, offset);
 		my_first = min(my_first, other);
 	}
 	if (lane_id == 0) first_nonzero = my_first;
-	first_nonzero = warp.shfl(first_nonzero, 0);
+	first_nonzero = __shfl_sync(0xFFFFFFFF, first_nonzero, 0);
 	
 	// Build output string cooperatively
 	if (lane_id == 0) {
@@ -609,7 +606,7 @@ __device__ void warp_cooperative_b58enc(
 		for (int i = first_nonzero; i < 45; i++) *ptr++ = b58digits[buf[i]];
 		*ptr = '\0';
 	}
-	warp.sync();
+	__syncwarp();
 }
 
 __device__ bool warp_check_prefix_simd(
@@ -617,9 +614,9 @@ __device__ bool warp_check_prefix_simd(
 	const char* prefixes[], 
 	const int* prefix_lengths,
 	int num_prefixes,
-	cg::thread_block_tile<32>& warp
+	int* keys_found
 ) {
-	int lane_id = warp.thread_rank();
+	int lane_id = threadIdx.x % 32;
 	bool found_match = false;
 	
 	// Each thread checks different prefixes in parallel
@@ -642,7 +639,7 @@ __device__ bool warp_check_prefix_simd(
 		}
 		
 		// Check if any thread found a match
-		uint32_t match_mask = warp.ballot(my_match);
+		uint32_t match_mask = __ballot_sync(0xFFFFFFFF, my_match);
 		if (match_mask != 0) {
 			found_match = true;
 			
@@ -660,13 +657,9 @@ __device__ bool warp_check_prefix_simd(
 }
 
 void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, unsigned long long int* exec_count) {
-	// Cooperative groups setup
-	cg::thread_block block = cg::this_thread_block();
-	cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-	
 	int global_id = blockIdx.x * blockDim.x + threadIdx.x;
 	int warp_id = global_id / 32;
-	int lane_id = warp.thread_rank();
+	int lane_id = threadIdx.x % 32;
 	
 	// Bounds check
 	if (global_id >= gridDim.x * blockDim.x) return;
@@ -688,7 +681,7 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 			shared_prefix_lengths[n] = len;
 		}
 	}
-	block.sync();
+	__syncthreads();
 	
 	// Warp-level state
 	curandState localState = state[global_id];
@@ -704,7 +697,7 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		uint32_t rand_val = curand(&localState);
 		((uint32_t*)seed)[lane_id] = rand_val;
 	}
-	warp.sync();
+	__syncwarp();
 	
 	// Process multiple attempts with SIMD efficiency
 	for (int attempts = 0; attempts < ATTEMPTS_PER_EXECUTION; attempts++) {
@@ -730,7 +723,7 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		if (lane_id < 2) { // 2 * 16 bytes = 32 bytes
 			buf_vec[lane_id] = seed_vec[lane_id];
 		}
-		warp.sync();
+		__syncwarp();
 		md.curlen += 32;
 		
 		// Complete SHA512 (simplified version)
@@ -796,10 +789,10 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		ge_p3_tobytes(publick, &A);
 		
 		// Warp-cooperative Base58 encoding
-		warp_cooperative_b58enc(key, publick, warp);
+		warp_cooperative_b58enc(key, publick);
 		
 		// SIMD prefix checking
-		if (warp_check_prefix_simd(key, prefixes, shared_prefix_lengths, shared_num_prefixes, warp)) {
+		if (warp_check_prefix_simd(key, prefixes, shared_prefix_lengths, shared_num_prefixes, keys_found)) {
 			// Match found, details already handled in warp_check_prefix_simd
 			if (lane_id == 0) {
 				printf("GPU %d SIMD MATCH %s\n", *gpu, key);
@@ -816,9 +809,9 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		// Broadcast updated seed to warp
 		uint4* seed_broadcast = (uint4*)seed;
 		for (int i = 0; i < 2; i++) {
-			seed_broadcast[i] = warp.shfl(seed_broadcast[i], 0);
+			seed_broadcast[i] = __shfl_sync(0xFFFFFFFF, seed_broadcast[i], 0);
 		}
-		warp.sync();
+		__syncwarp();
 	}
 	
 	// Update state
