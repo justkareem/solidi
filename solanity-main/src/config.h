@@ -1,12 +1,12 @@
 #ifndef VANITY_CONFIG
 #define VANITY_CONFIG
 
-// Optimized for modern GPUs with more compute units
+// Server-grade optimization: 4x RTX 5070 @ 121.5 TFLOPS each + 552GB/s bandwidth
 static int const MAX_ITERATIONS = 1000000;
 static int const STOP_AFTER_KEYS_FOUND = 100;
 
-// Increased for modern GPUs - more threads can handle larger batches
-__device__ const int ATTEMPTS_PER_EXECUTION = 500000;
+// Extreme workload for server hardware: 486 TFLOPS total + 2208GB/s total bandwidth
+__device__ const int ATTEMPTS_PER_EXECUTION = 5000000;
 
 // Support more patterns for better search flexibility
 __device__ const int MAX_PATTERNS = 50;
