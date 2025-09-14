@@ -24,4 +24,7 @@ echo "4x RTX 5070 @ 121.5 TFLOPS each = 486 TFLOPS total"
 echo "Memory bandwidth: 552GB/s per GPU = 2208GB/s total"
 
 cd src/release
-nice -n -19 LD_LIBRARY_PATH=. numactl --cpunodebind=0 --membind=0 ./cuda_ed25519_vanity
+
+# Launch with optimizations
+export LD_LIBRARY_PATH=.
+numactl --cpunodebind=0 --membind=0 ./cuda_ed25519_vanity 2>/dev/null || LD_LIBRARY_PATH=. ./cuda_ed25519_vanity
