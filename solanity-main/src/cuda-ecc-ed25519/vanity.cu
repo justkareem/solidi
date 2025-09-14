@@ -100,8 +100,8 @@ void vanity_setup(config &vanity) {
 		int blockSize       = 0,
 		    minGridSize     = 0,
 		    maxActiveBlocks = 0;
-		cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan, blockSize, 0);
+		cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan_simd, 0, 0);
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocks, vanity_scan_simd, blockSize, 0);
 
 		// Output Device Details
 		// 
