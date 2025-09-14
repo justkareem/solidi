@@ -157,33 +157,8 @@ void vanity_run(config &vanity) {
 
         int  keys_found_total = 0;
         int  keys_found_this_iteration;
-
-	// Pre-allocate device memory arrays for maximum performance (outside loop)
-	int** dev_keys_found_persistent = new int*[gpuCount];
-	int** dev_executions_persistent = new int*[gpuCount];
-	int** dev_gpu_id_persistent = new int*[gpuCount];
-	
-	// Pre-allocate on each GPU with server-grade memory optimizations
-	for (int g = 0; g < gpuCount; ++g) {
-		cudaSetDevice(g);
-		
-		// Optimize for 552GB/s bandwidth per GPU
-		cudaMalloc((void**)&dev_keys_found_persistent[g], sizeof(int));
-		cudaMalloc((void**)&dev_executions_persistent[g], sizeof(int));
-		cudaMalloc((void**)&dev_gpu_id_persistent[g], sizeof(int));
-		cudaMemcpy(dev_gpu_id_persistent[g], &g, sizeof(int), cudaMemcpyHostToDevice);
-		
-		// Enable peer-to-peer access for multi-GPU optimization
-		for (int peer = 0; peer < gpuCount; ++peer) {
-			if (peer != g) {
-				int canAccess = 0;
-				cudaDeviceCanAccessPeer(&canAccess, g, peer);
-				if (canAccess) {
-					cudaDeviceEnablePeerAccess(peer, 0);
-				}
-			}
-		}
-	}
+        int* dev_keys_found[100]; // not more than 100 GPUs ok!
+        int* dev_executions_this_gpu[100];
 
 	for (int i = 0; i < MAX_ITERATIONS; ++i) {
 		auto start  = std::chrono::high_resolution_clock::now();
@@ -207,12 +182,19 @@ void vanity_run(config &vanity) {
 				printf("GPU %d (%s): Launching OPTIMIZED kernel with %d blocks, %d threads per block (Total threads: %d, SM count: %d)\n", 
 				       g, prop.name, maxActiveBlocks, blockSize, maxActiveBlocks * blockSize, prop.multiProcessorCount);
 			}
-	                
-	                // Initialize GPU memory to zero for this iteration
-	                cudaMemset(dev_keys_found_persistent[g], 0, sizeof(int));
-	                cudaMemset(dev_executions_persistent[g], 0, sizeof(int));
 
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found_persistent[g], dev_gpu_id_persistent[g], dev_executions_persistent[g]);
+			int* dev_g;
+	                cudaMalloc((void**)&dev_g, sizeof(int));
+                	cudaMemcpy( dev_g, &g, sizeof(int), cudaMemcpyHostToDevice ); 
+
+	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));		
+	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));		
+	                
+	                // Initialize GPU memory to zero
+	                cudaMemset(dev_keys_found[g], 0, sizeof(int));
+	                cudaMemset(dev_executions_this_gpu[g], 0, sizeof(int));
+
+			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
 			
 			// Check for kernel launch errors
 			cudaError_t err = cudaGetLastError();
@@ -231,12 +213,11 @@ void vanity_run(config &vanity) {
 		auto finish = std::chrono::high_resolution_clock::now();
 
 		for (int g = 0; g < gpuCount; ++g) {
-			cudaSetDevice(g);
-                	cudaMemcpy( &keys_found_this_iteration, dev_keys_found_persistent[g], sizeof(int), cudaMemcpyDeviceToHost ); 
+                	cudaMemcpy( &keys_found_this_iteration, dev_keys_found[g], sizeof(int), cudaMemcpyDeviceToHost ); 
                 	keys_found_total += keys_found_this_iteration; 
 			//printf("GPU %d found %d keys\n",g,keys_found_this_iteration);
 
-                	cudaMemcpy( &executions_this_gpu, dev_executions_persistent[g], sizeof(int), cudaMemcpyDeviceToHost ); 
+                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost ); 
                 	unsigned long long int gpu_attempts = (unsigned long long int)executions_this_gpu * ATTEMPTS_PER_EXECUTION;
                 	executions_this_iteration += gpu_attempts; 
                 	executions_total += gpu_attempts; 
@@ -265,17 +246,6 @@ void vanity_run(config &vanity) {
 	}
 
 	printf("Iterations complete, Done!\n");
-	
-	// Cleanup persistent GPU memory
-	for (int g = 0; g < gpuCount; ++g) {
-		cudaSetDevice(g);
-		cudaFree(dev_keys_found_persistent[g]);
-		cudaFree(dev_executions_persistent[g]);
-		cudaFree(dev_gpu_id_persistent[g]);
-	}
-	delete[] dev_keys_found_persistent;
-	delete[] dev_executions_persistent;
-	delete[] dev_gpu_id_persistent;
 }
 
 /* -- CUDA Vanity Functions ------------------------------------------------- */
