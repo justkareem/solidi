@@ -5,8 +5,8 @@
 static int const MAX_ITERATIONS = 1000000;
 static int const STOP_AFTER_KEYS_FOUND = 100;
 
-// Extreme workload for server hardware: 486 TFLOPS total + 2208GB/s total bandwidth
-__device__ const int ATTEMPTS_PER_EXECUTION = 5000000;
+// High performance but realistic workload for RTX 5070
+__device__ const int ATTEMPTS_PER_EXECUTION = 1000000;
 
 // Support more patterns for better search flexibility
 __device__ const int MAX_PATTERNS = 50;

@@ -197,10 +197,10 @@ void vanity_run(config &vanity) {
 			cudaDeviceProp prop;
 			cudaGetDeviceProperties(&prop, g);
 			
-			// Server-grade RTX 5070 optimization: 552GB/s bandwidth + PCIe 3.0
-			int blockSize = 1024; // Maximum block size 
-			// With 121.5 TFLOPS and 552GB/s bandwidth, maximize occupancy
-			int maxActiveBlocks = prop.multiProcessorCount * 16; // Extreme occupancy for server hardware
+			// Optimized but realistic RTX 5070 configuration
+			int blockSize = 512; // Balanced block size for high occupancy
+			// Scale back to avoid "too many resources" error
+			int maxActiveBlocks = prop.multiProcessorCount * 6; // High but achievable occupancy
 			
 			// Debug: Print kernel launch parameters on first iteration
 			if (i == 0) {
