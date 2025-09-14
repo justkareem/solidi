@@ -172,10 +172,9 @@ void vanity_run(config &vanity) {
 			cudaDeviceProp prop;
 			cudaGetDeviceProperties(&prop, g);
 			
-			// Optimized but realistic RTX 5070 configuration
-			int blockSize = 512; // Balanced block size for high occupancy
-			// Scale back to avoid "too many resources" error
-			int maxActiveBlocks = prop.multiProcessorCount * 6; // High but achievable occupancy
+			// Conservative but working RTX 5070 configuration
+			int blockSize = 256; // Safe block size
+			int maxActiveBlocks = prop.multiProcessorCount * 3; // Conservative occupancy
 			
 			// Debug: Print kernel launch parameters on first iteration
 			if (i == 0) {
@@ -257,18 +256,21 @@ void __global__ vanity_init(unsigned long long int* rseed, curandState* state) {
 
 void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* exec_count) {
 	int id = threadIdx.x + (blockIdx.x * blockDim.x);
+	
+	// Bounds check for thread ID to prevent illegal memory access
+	int total_threads = gridDim.x * blockDim.x;
+	if (id >= total_threads) {
+		return;
+	}
 
         atomicAdd(exec_count, 1);
 
-	// SMITH - should really be passed in, but hey ho
+	// Calculate actual number of prefixes, bounded by MAX_PATTERNS
+	const int num_prefixes = min((int)(sizeof(prefixes) / sizeof(prefixes[0])), MAX_PATTERNS);
     	int prefix_letter_counts[MAX_PATTERNS];
-    	for (unsigned int n = 0; n < sizeof(prefixes) / sizeof(prefixes[0]); ++n) {
-        	if ( MAX_PATTERNS == n ) {
-            		printf("NEVER SPEAK TO ME OR MY SON AGAIN");
-            		return;
-        	}
+    	for (int n = 0; n < num_prefixes; ++n) {
         	int letter_count = 0;
-        	for(; prefixes[n][letter_count]!=0; letter_count++);
+        	for(; prefixes[n][letter_count]!=0 && letter_count < 256; letter_count++);
         	prefix_letter_counts[n] = letter_count;
     	}
 
@@ -426,7 +428,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 		// so it might make sense to write a new parallel kernel to do
 		// this.
 
-                for (int i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
+                for (int i = 0; i < num_prefixes; ++i) {
 
                         for (int j = 0; j<prefix_letter_counts[i]; ++j) {
 

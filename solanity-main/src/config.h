@@ -5,8 +5,8 @@
 static int const MAX_ITERATIONS = 1000000;
 static int const STOP_AFTER_KEYS_FOUND = 100;
 
-// High performance but realistic workload for RTX 5070
-__device__ const int ATTEMPTS_PER_EXECUTION = 1000000;
+// Reduced workload to prevent memory pressure and illegal access
+__device__ const int ATTEMPTS_PER_EXECUTION = 100000;
 
 // Support more patterns for better search flexibility
 __device__ const int MAX_PATTERNS = 50;
