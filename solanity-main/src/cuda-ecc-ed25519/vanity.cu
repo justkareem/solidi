@@ -517,97 +517,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 /* -- SIMD Optimized CUDA Vanity Kernel ------------------------------------ */
 
-__device__ void warp_cooperative_b58enc(
-	char* b58_output,
-	uint8_t* data
-) {
-	const char b58digits[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-	
-	__shared__ uint8_t shared_buf[32][45]; // 32 warps per block max, 45 bytes max output
-	__shared__ uint8_t shared_data[32][32]; // Input data per warp
-	
-	int warp_id = threadIdx.x / 32;
-	int lane_id = threadIdx.x % 32;
-	
-	// Cooperatively load input data
-	if (lane_id < 32) {
-		shared_data[warp_id][lane_id] = data[lane_id];
-	}
-	warp.sync();
-	
-	// Each thread handles part of the Base58 conversion
-	uint8_t* buf = shared_buf[warp_id];
-	uint8_t* bin = shared_data[warp_id];
-	
-	// Initialize buffer cooperatively
-	if (lane_id < 45) {
-		buf[lane_id] = 0;
-	}
-	warp.sync();
-	
-	// Count leading zeros cooperatively
-	int zcount = 0;
-	int my_zero = (lane_id < 32 && bin[lane_id] == 0) ? 1 : 0;
-	uint32_t zero_mask = __ballot_sync(0xFFFFFFFF, my_zero);
-	if (lane_id == 0) {
-		zcount = __clz(__brev(zero_mask | (1u << 31))) - (32 - 32); // Count trailing zeros
-		if (zcount > 32) zcount = 32;
-	}
-	zcount = __shfl_sync(0xFFFFFFFF, zcount, 0);
-	
-	// Parallel division algorithm
-	for (int i = zcount; i < 32; ++i) {
-		int carry = (lane_id == 0) ? bin[i] : 0;
-		
-		// Broadcast input byte to all threads
-		carry = __shfl_sync(0xFFFFFFFF, carry, 0);
-		
-		// Each thread processes different positions
-		for (int pos = 44 - lane_id; pos >= 0; pos -= 32) {
-			if (pos >= 0 && pos < 45) {
-				carry += (int)buf[pos] << 8;
-				buf[pos] = carry % 58;
-				carry /= 58;
-			}
-		}
-		__syncwarp();
-		
-		// Propagate carry values
-		int next_carry = __shfl_up_sync(0xFFFFFFFF, carry, 1);
-		if (lane_id > 0 && next_carry > 0) {
-			// Handle carry propagation
-			for (int pos = 44 - (lane_id - 1); pos >= 0; pos -= 32) {
-				if (pos >= 0 && pos < 45) {
-					next_carry += (int)buf[pos] << 8;
-					buf[pos] = next_carry % 58;
-					next_carry /= 58;
-				}
-			}
-		}
-		__syncwarp();
-	}
-	
-	// Find first non-zero cooperatively  
-	int first_nonzero = 45;
-	int my_first = (lane_id < 45 && buf[lane_id] != 0) ? lane_id : 45;
-	
-	// Reduce to find minimum
-	for (int offset = 16; offset > 0; offset /= 2) {
-		int other = __shfl_down_sync(0xFFFFFFFF, my_first, offset);
-		my_first = min(my_first, other);
-	}
-	if (lane_id == 0) first_nonzero = my_first;
-	first_nonzero = __shfl_sync(0xFFFFFFFF, first_nonzero, 0);
-	
-	// Build output string cooperatively
-	if (lane_id == 0) {
-		char* ptr = b58_output;
-		for (int i = 0; i < zcount; i++) *ptr++ = '1';
-		for (int i = first_nonzero; i < 45; i++) *ptr++ = b58digits[buf[i]];
-		*ptr = '\0';
-	}
-	__syncwarp();
-}
+// Simplified SIMD prefix checking - main optimization focus
 
 __device__ bool warp_check_prefix_simd(
 	const char* key,
@@ -692,12 +602,12 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 	__align__(16) unsigned char privatek[64];
 	__align__(16) char key[64]; // Aligned for better memory access
 	
-	// Generate initial seed cooperatively
-	if (lane_id < 8) {
-		uint32_t rand_val = curand(&localState);
-		((uint32_t*)seed)[lane_id] = rand_val;
+	// Generate initial seed (each thread independent)
+	for (int i = 0; i < 32; ++i) {
+		float random = curand_uniform(&localState);
+		uint8_t keybyte = (uint8_t)(random * 255);
+		seed[i] = keybyte;
 	}
-	__syncwarp();
 	
 	// Process multiple attempts with SIMD efficiency
 	for (int attempts = 0; attempts < ATTEMPTS_PER_EXECUTION; attempts++) {
@@ -717,13 +627,11 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		md.state[6] = UINT64_C(0x1f83d9abfb41bd6b);
 		md.state[7] = UINT64_C(0x5be0cd19137e2179);
 		
-		// Copy seed with vectorized loads
-		uint4* seed_vec = (uint4*)seed;
-		uint4* buf_vec = (uint4*)(md.buf + md.curlen);
-		if (lane_id < 2) { // 2 * 16 bytes = 32 bytes
-			buf_vec[lane_id] = seed_vec[lane_id];
+		// Copy seed to SHA512 buffer
+		const unsigned char *in = seed;
+		for (size_t i = 0; i < 32; i++) {
+			md.buf[i + md.curlen] = in[i];
 		}
-		__syncwarp();
 		md.curlen += 32;
 		
 		// Complete SHA512 (simplified version)
@@ -788,8 +696,9 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		ge_scalarmult_base(&A, privatek);
 		ge_p3_tobytes(publick, &A);
 		
-		// Warp-cooperative Base58 encoding
-		warp_cooperative_b58enc(key, publick);
+		// Use optimized Base58 encoding
+		size_t keysize = 64;
+		b58enc_optimized(key, &keysize, publick, 32);
 		
 		// SIMD prefix checking
 		if (warp_check_prefix_simd(key, prefixes, shared_prefix_lengths, shared_num_prefixes, keys_found)) {
@@ -799,19 +708,11 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 			}
 		}
 		
-		// Vectorized seed increment (warp cooperative)
-		if (lane_id == 0) {
-			uint32_t* seed_u32 = (uint32_t*)seed;
-			for (int i = 0; i < 8; ++i) {
-				if (++seed_u32[i] != 0) break;
-			}
+		// Simple seed increment (each thread independent for stability)
+		uint32_t* seed_u32 = (uint32_t*)seed;
+		for (int i = 0; i < 8; ++i) {
+			if (++seed_u32[i] != 0) break;
 		}
-		// Broadcast updated seed to warp
-		uint4* seed_broadcast = (uint4*)seed;
-		for (int i = 0; i < 2; i++) {
-			seed_broadcast[i] = __shfl_sync(0xFFFFFFFF, seed_broadcast[i], 0);
-		}
-		__syncwarp();
 	}
 	
 	// Update state
