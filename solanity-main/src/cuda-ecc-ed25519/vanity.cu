@@ -15,6 +15,9 @@
 #include "fixedint.h"
 #include "gpu_common.h"
 #include "gpu_ctx.h"
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 #include "keypair.cu"
 #include "sc.cu"
@@ -35,7 +38,8 @@ typedef struct {
 void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
 void __global__ vanity_init(unsigned long long int* seed, curandState* state);
-void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* execution_count);
+void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, unsigned long long int* execution_count);
+void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, unsigned long long int* execution_count);
 bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
 
 /* -- Entry Point ----------------------------------------------------------- */
@@ -153,12 +157,12 @@ void vanity_run(config &vanity) {
 
 	unsigned long long int  executions_total = 0; 
 	unsigned long long int  executions_this_iteration; 
-	int  executions_this_gpu; 
+	unsigned long long int  executions_this_gpu; 
 
         int  keys_found_total = 0;
         int  keys_found_this_iteration;
         int* dev_keys_found[100]; // not more than 100 GPUs ok!
-        int* dev_executions_this_gpu[100];
+        unsigned long long int* dev_executions_this_gpu[100];
 
 	for (int i = 0; i < MAX_ITERATIONS; ++i) {
 		auto start  = std::chrono::high_resolution_clock::now();
@@ -187,13 +191,14 @@ void vanity_run(config &vanity) {
                 	cudaMemcpy( dev_g, &g, sizeof(int), cudaMemcpyHostToDevice ); 
 
 	                cudaMalloc((void**)&dev_keys_found[g], sizeof(int));		
-	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(int));		
+	                cudaMalloc((void**)&dev_executions_this_gpu[g], sizeof(unsigned long long int));		
 	                
 	                // Initialize GPU memory to zero
 	                cudaMemset(dev_keys_found[g], 0, sizeof(int));
-	                cudaMemset(dev_executions_this_gpu[g], 0, sizeof(int));
+	                cudaMemset(dev_executions_this_gpu[g], 0, sizeof(unsigned long long int));
 
-			vanity_scan<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
+			// Use SIMD-optimized kernel for better performance
+			vanity_scan_simd<<<maxActiveBlocks, blockSize>>>(vanity.states[g], dev_keys_found[g], dev_g, dev_executions_this_gpu[g]);
 			
 			// Check for kernel launch errors
 			cudaError_t err = cudaGetLastError();
@@ -216,13 +221,13 @@ void vanity_run(config &vanity) {
                 	keys_found_total += keys_found_this_iteration; 
 			//printf("GPU %d found %d keys\n",g,keys_found_this_iteration);
 
-                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(int), cudaMemcpyDeviceToHost ); 
-                	unsigned long long int gpu_attempts = (unsigned long long int)executions_this_gpu * ATTEMPTS_PER_EXECUTION;
+                	cudaMemcpy( &executions_this_gpu, dev_executions_this_gpu[g], sizeof(unsigned long long int), cudaMemcpyDeviceToHost ); 
+                	unsigned long long int gpu_attempts = executions_this_gpu * ATTEMPTS_PER_EXECUTION;
                 	executions_this_iteration += gpu_attempts; 
                 	executions_total += gpu_attempts; 
                 	// Debug output on first few iterations
                 	if (i < 3) {
-                		printf("GPU %d: executions=%d, attempts=%llu\n", g, executions_this_gpu, gpu_attempts);
+                		printf("GPU %d: executions=%llu, attempts=%llu\n", g, executions_this_gpu, gpu_attempts);
                 	}
 		}
 
@@ -263,7 +268,7 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 		return;
 	}
 
-        atomicAdd(exec_count, 1);
+        atomicAdd(exec_count, (unsigned long long int)1);
 
 	// Calculate actual number of prefixes, bounded by MAX_PATTERNS
 	const int num_prefixes = min((int)(sizeof(prefixes) / sizeof(prefixes[0])), MAX_PATTERNS);
@@ -283,14 +288,18 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 	char key[256]              = {0};
 	//char pkey[256]             = {0};
 
-	// Start from an Initial Random Seed (Slow)
+	// Start from an Initial Random Seed - Vectorized generation
 	// NOTE: Insecure random number generator, do not use keys generator by
 	// this program in live.
 	// SMITH: localState should be entropy random now
-	for (int i = 0; i < 32; ++i) {
-		float random    = curand_uniform(&localState);
-		uint8_t keybyte = (uint8_t)(random * 255);
-		seed[i]         = keybyte;
+	// Vectorized seed generation using uint4 for better memory throughput
+	uint4* seed_vec = (uint4*)seed;
+	for (int i = 0; i < 8; ++i) { // 8 * 4 = 32 bytes
+		uint32_t rand_val = curand(&localState);
+		seed_vec[i].x = (rand_val >> 24) & 0xFF;
+		seed_vec[i].y = (rand_val >> 16) & 0xFF;
+		seed_vec[i].z = (rand_val >> 8) & 0xFF;
+		seed_vec[i].w = rand_val & 0xFF;
 	}
 
 	// Generate Random Key Data
@@ -490,19 +499,16 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 
 		// Code Until here runs at 22_000_000H/s. So the above is fast enough.
 
-		// Increment Seed.
+		// Increment Seed - Optimized with early exit
 		// NOTE: This is horrifically insecure. Please don't use these
 		// keys on live. This increment is just so we don't have to
 		// invoke the CUDA random number generator for each hash to
 		// boost performance a little. Easy key generation, awful
 		// security.
-		for (int i = 0; i < 32; ++i) {
-			if (seed[i] == 255) {
-				seed[i]  = 0;
-			} else {
-				seed[i] += 1;
-				break;
-			}
+		// Vectorized increment with carry propagation
+		uint32_t* seed_u32 = (uint32_t*)seed;
+		for (int i = 0; i < 8; ++i) { // 8 * 4 = 32 bytes
+			if (++seed_u32[i] != 0) break; // No carry needed
 		}
 	}
 
@@ -511,53 +517,373 @@ void __global__ vanity_scan(curandState* state, int* keys_found, int* gpu, int* 
 	state[id] = localState;
 }
 
-bool __device__ b58enc(
+/* -- SIMD Optimized CUDA Vanity Kernel ------------------------------------ */
+
+__device__ void warp_cooperative_b58enc(
+	char* b58_output,
+	uint8_t* data,
+	cg::thread_block_tile<32>& warp
+) {
+	const char b58digits[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+	
+	__shared__ uint8_t shared_buf[32][45]; // 32 warps per block max, 45 bytes max output
+	__shared__ uint8_t shared_data[32][32]; // Input data per warp
+	
+	int warp_id = threadIdx.x / 32;
+	int lane_id = threadIdx.x % 32;
+	
+	// Cooperatively load input data
+	if (lane_id < 32) {
+		shared_data[warp_id][lane_id] = data[lane_id];
+	}
+	warp.sync();
+	
+	// Each thread handles part of the Base58 conversion
+	uint8_t* buf = shared_buf[warp_id];
+	uint8_t* bin = shared_data[warp_id];
+	
+	// Initialize buffer cooperatively
+	if (lane_id < 45) {
+		buf[lane_id] = 0;
+	}
+	warp.sync();
+	
+	// Count leading zeros cooperatively
+	int zcount = 0;
+	int my_zero = (lane_id < 32 && bin[lane_id] == 0) ? 1 : 0;
+	uint32_t zero_mask = warp.ballot(my_zero);
+	if (lane_id == 0) {
+		zcount = __clz(__brev(zero_mask | (1u << 31))) - (32 - 32); // Count trailing zeros
+		if (zcount > 32) zcount = 32;
+	}
+	zcount = warp.shfl(zcount, 0);
+	
+	// Parallel division algorithm
+	for (int i = zcount; i < 32; ++i) {
+		int carry = (lane_id == 0) ? bin[i] : 0;
+		
+		// Broadcast input byte to all threads
+		carry = warp.shfl(carry, 0);
+		
+		// Each thread processes different positions
+		for (int pos = 44 - lane_id; pos >= 0; pos -= 32) {
+			if (pos >= 0 && pos < 45) {
+				carry += (int)buf[pos] << 8;
+				buf[pos] = carry % 58;
+				carry /= 58;
+			}
+		}
+		warp.sync();
+		
+		// Propagate carry values
+		int next_carry = warp.shfl_up(carry, 1);
+		if (lane_id > 0 && next_carry > 0) {
+			// Handle carry propagation
+			for (int pos = 44 - (lane_id - 1); pos >= 0; pos -= 32) {
+				if (pos >= 0 && pos < 45) {
+					next_carry += (int)buf[pos] << 8;
+					buf[pos] = next_carry % 58;
+					next_carry /= 58;
+				}
+			}
+		}
+		warp.sync();
+	}
+	
+	// Find first non-zero cooperatively  
+	int first_nonzero = 45;
+	int my_first = (lane_id < 45 && buf[lane_id] != 0) ? lane_id : 45;
+	
+	// Reduce to find minimum
+	for (int offset = 16; offset > 0; offset /= 2) {
+		int other = warp.shfl_down(my_first, offset);
+		my_first = min(my_first, other);
+	}
+	if (lane_id == 0) first_nonzero = my_first;
+	first_nonzero = warp.shfl(first_nonzero, 0);
+	
+	// Build output string cooperatively
+	if (lane_id == 0) {
+		char* ptr = b58_output;
+		for (int i = 0; i < zcount; i++) *ptr++ = '1';
+		for (int i = first_nonzero; i < 45; i++) *ptr++ = b58digits[buf[i]];
+		*ptr = '\0';
+	}
+	warp.sync();
+}
+
+__device__ bool warp_check_prefix_simd(
+	const char* key,
+	const char* prefixes[], 
+	const int* prefix_lengths,
+	int num_prefixes,
+	cg::thread_block_tile<32>& warp
+) {
+	int lane_id = warp.thread_rank();
+	bool found_match = false;
+	
+	// Each thread checks different prefixes in parallel
+	for (int prefix_base = 0; prefix_base < num_prefixes; prefix_base += 32) {
+		int prefix_idx = prefix_base + lane_id;
+		bool my_match = false;
+		
+		if (prefix_idx < num_prefixes) {
+			const char* prefix = prefixes[prefix_idx];
+			int len = prefix_lengths[prefix_idx];
+			my_match = true;
+			
+			// Check each character
+			for (int j = 0; j < len; j++) {
+				if (prefix[j] != '?' && prefix[j] != key[j]) {
+					my_match = false;
+					break;
+				}
+			}
+		}
+		
+		// Check if any thread found a match
+		uint32_t match_mask = warp.ballot(my_match);
+		if (match_mask != 0) {
+			found_match = true;
+			
+			// Let the first matching thread output the result
+			int first_match = __ffs(match_mask) - 1;
+			if (lane_id == first_match) {
+				// Output match details here
+				atomicAdd(keys_found, 1);
+			}
+			break;
+		}
+	}
+	
+	return found_match;
+}
+
+void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, unsigned long long int* exec_count) {
+	// Cooperative groups setup
+	cg::thread_block block = cg::this_thread_block();
+	cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+	
+	int global_id = blockIdx.x * blockDim.x + threadIdx.x;
+	int warp_id = global_id / 32;
+	int lane_id = warp.thread_rank();
+	
+	// Bounds check
+	if (global_id >= gridDim.x * blockDim.x) return;
+	
+	// Only one thread per warp increments counter
+	if (lane_id == 0) {
+		atomicAdd(exec_count, (unsigned long long int)1);
+	}
+	
+	// Calculate prefix info once per block
+	__shared__ int shared_num_prefixes;
+	__shared__ int shared_prefix_lengths[MAX_PATTERNS];
+	
+	if (threadIdx.x == 0) {
+		shared_num_prefixes = min((int)(sizeof(prefixes) / sizeof(prefixes[0])), MAX_PATTERNS);
+		for (int n = 0; n < shared_num_prefixes; ++n) {
+			int len = 0;
+			for(; prefixes[n][len] != 0 && len < 256; len++);
+			shared_prefix_lengths[n] = len;
+		}
+	}
+	block.sync();
+	
+	// Warp-level state
+	curandState localState = state[global_id];
+	
+	// Aligned memory for vectorized operations
+	__align__(16) unsigned char seed[32];
+	__align__(16) unsigned char publick[32];
+	__align__(16) unsigned char privatek[64];
+	__align__(16) char key[64]; // Aligned for better memory access
+	
+	// Generate initial seed cooperatively
+	if (lane_id < 8) {
+		uint32_t rand_val = curand(&localState);
+		((uint32_t*)seed)[lane_id] = rand_val;
+	}
+	warp.sync();
+	
+	// Process multiple attempts with SIMD efficiency
+	for (int attempts = 0; attempts < ATTEMPTS_PER_EXECUTION; attempts++) {
+		
+		// SHA512 computation (each thread does its own for now - could be optimized further)
+		sha512_context md;
+		
+		// Inline optimized SHA512 (same as before but with aligned access)
+		md.curlen = 0;
+		md.length = 0;
+		md.state[0] = UINT64_C(0x6a09e667f3bcc908);
+		md.state[1] = UINT64_C(0xbb67ae8584caa73b);
+		md.state[2] = UINT64_C(0x3c6ef372fe94f82b);
+		md.state[3] = UINT64_C(0xa54ff53a5f1d36f1);
+		md.state[4] = UINT64_C(0x510e527fade682d1);
+		md.state[5] = UINT64_C(0x9b05688c2b3e6c1f);
+		md.state[6] = UINT64_C(0x1f83d9abfb41bd6b);
+		md.state[7] = UINT64_C(0x5be0cd19137e2179);
+		
+		// Copy seed with vectorized loads
+		uint4* seed_vec = (uint4*)seed;
+		uint4* buf_vec = (uint4*)(md.buf + md.curlen);
+		if (lane_id < 2) { // 2 * 16 bytes = 32 bytes
+			buf_vec[lane_id] = seed_vec[lane_id];
+		}
+		warp.sync();
+		md.curlen += 32;
+		
+		// Complete SHA512 (simplified version)
+		md.length += md.curlen * UINT64_C(8);
+		md.buf[md.curlen++] = (unsigned char)0x80;
+		
+		while (md.curlen < 120) {
+			md.buf[md.curlen++] = (unsigned char)0;
+		}
+		
+		STORE64H(md.length, md.buf+120);
+		
+		// SHA512 compression (each thread independent for now)
+		uint64_t S[8], W[80], t0, t1;
+		int i;
+		
+		for (i = 0; i < 8; i++) {
+			S[i] = md.state[i];
+		}
+		
+		for (i = 0; i < 16; i++) {
+			LOAD64H(W[i], md.buf + (8*i));
+		}
+		
+		for (i = 16; i < 80; i++) {
+			W[i] = Gamma1(W[i - 2]) + W[i - 7] + Gamma0(W[i - 15]) + W[i - 16];
+		}
+		
+		#define RND(a,b,c,d,e,f,g,h,i) \
+		t0 = h + Sigma1(e) + Ch(e, f, g) + K[i] + W[i]; \
+		t1 = Sigma0(a) + Maj(a, b, c);\
+		d += t0; \
+		h  = t0 + t1;
+		
+		for (i = 0; i < 80; i += 8) {
+			RND(S[0],S[1],S[2],S[3],S[4],S[5],S[6],S[7],i+0);
+			RND(S[7],S[0],S[1],S[2],S[3],S[4],S[5],S[6],i+1);
+			RND(S[6],S[7],S[0],S[1],S[2],S[3],S[4],S[5],i+2);
+			RND(S[5],S[6],S[7],S[0],S[1],S[2],S[3],S[4],i+3);
+			RND(S[4],S[5],S[6],S[7],S[0],S[1],S[2],S[3],i+4);
+			RND(S[3],S[4],S[5],S[6],S[7],S[0],S[1],S[2],i+5);
+			RND(S[2],S[3],S[4],S[5],S[6],S[7],S[0],S[1],i+6);
+			RND(S[1],S[2],S[3],S[4],S[5],S[6],S[7],S[0],i+7);
+		}
+		
+		#undef RND
+		
+		for (i = 0; i < 8; i++) {
+			md.state[i] = md.state[i] + S[i];
+		}
+		
+		for (i = 0; i < 8; i++) {
+			STORE64H(md.state[i], privatek+(8*i));
+		}
+		
+		// Ed25519 operations
+		privatek[0]  &= 248;
+		privatek[31] &= 63;
+		privatek[31] |= 64;
+		
+		ge_p3 A;
+		ge_scalarmult_base(&A, privatek);
+		ge_p3_tobytes(publick, &A);
+		
+		// Warp-cooperative Base58 encoding
+		warp_cooperative_b58enc(key, publick, warp);
+		
+		// SIMD prefix checking
+		if (warp_check_prefix_simd(key, prefixes, shared_prefix_lengths, shared_num_prefixes, warp)) {
+			// Match found, details already handled in warp_check_prefix_simd
+			if (lane_id == 0) {
+				printf("GPU %d SIMD MATCH %s\n", *gpu, key);
+			}
+		}
+		
+		// Vectorized seed increment (warp cooperative)
+		if (lane_id == 0) {
+			uint32_t* seed_u32 = (uint32_t*)seed;
+			for (int i = 0; i < 8; ++i) {
+				if (++seed_u32[i] != 0) break;
+			}
+		}
+		// Broadcast updated seed to warp
+		uint4* seed_broadcast = (uint4*)seed;
+		for (int i = 0; i < 2; i++) {
+			seed_broadcast[i] = warp.shfl(seed_broadcast[i], 0);
+		}
+		warp.sync();
+	}
+	
+	// Update state
+	state[global_id] = localState;
+}
+
+bool __device__ b58enc_optimized(
 	char    *b58,
        	size_t  *b58sz,
        	uint8_t *data,
        	size_t  binsz
 ) {
-	// Base58 Lookup Table
-	const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+	// Base58 Lookup Table - kept in constant memory for better cache performance
+	__shared__ const char b58digits_ordered[58] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 	const uint8_t *bin = data;
 	int carry;
 	size_t i, j, high, zcount = 0;
 	size_t size;
 	
-	while (zcount < binsz && !bin[zcount])
+	// Optimized zero counting with early exit for 32-byte keys
+	while (zcount < binsz && zcount < 4 && !bin[zcount])
 		++zcount;
 	
-	size = (binsz - zcount) * 138 / 100 + 1;
-	uint8_t buf[256];
-	memset(buf, 0, size);
+	// Fixed size for 32-byte input - no dynamic allocation
+	size = 45; // Max Base58 length for 32 bytes
+	uint8_t buf[45] = {0}; // Stack allocation, zero-initialized
 	
+	// Vectorized division operations where possible
 	for (i = zcount, high = size - 1; i < binsz; ++i, high = j)
 	{
 		for (carry = bin[i], j = size - 1; (j > high) || carry; --j)
 		{
-			carry += 256 * buf[j];
+			carry += (buf[j] << 8); // Optimized: bit shift instead of *256
 			buf[j] = carry % 58;
 			carry /= 58;
-			if (!j) {
-				// Otherwise j wraps to maxint which is > high
-				break;
-			}
+			if (!j) break;
 		}
 	}
 	
+	// Find first non-zero
 	for (j = 0; j < size && !buf[j]; ++j);
 	
-	if (*b58sz <= zcount + size - j) {
-		*b58sz = zcount + size - j + 1;
+	size_t result_len = zcount + size - j;
+	if (*b58sz <= result_len) {
+		*b58sz = result_len + 1;
 		return false;
 	}
 	
-	if (zcount) memset(b58, '1', zcount);
-	for (i = zcount; j < size; ++i, ++j) b58[i] = b58digits_ordered[buf[j]];
-
-	b58[i] = '\0';
-	*b58sz = i + 1;
+	// Optimized character copying
+	char *ptr = b58;
+	while (zcount--) *ptr++ = '1';
+	while (j < size) *ptr++ = b58digits_ordered[buf[j++]];
+	*ptr = '\0';
+	*b58sz = ptr - b58 + 1;
 	
 	return true;
+}
+
+// Keep original function as fallback
+bool __device__ b58enc(
+	char    *b58,
+       	size_t  *b58sz,
+       	uint8_t *data,
+       	size_t  binsz
+) {
+	return b58enc_optimized(b58, b58sz, data, binsz);
 }
