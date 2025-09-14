@@ -698,7 +698,7 @@ void __global__ vanity_scan_simd(curandState* state, int* keys_found, int* gpu, 
 		
 		// Use optimized Base58 encoding
 		size_t keysize = 64;
-		b58enc_optimized(key, &keysize, publick, 32);
+		b58enc(key, &keysize, publick, 32);
 		
 		// SIMD prefix checking
 		if (warp_check_prefix_simd(key, prefixes, shared_prefix_lengths, shared_num_prefixes, keys_found)) {
@@ -725,8 +725,8 @@ bool __device__ b58enc_optimized(
        	uint8_t *data,
        	size_t  binsz
 ) {
-	// Base58 Lookup Table - kept in constant memory for better cache performance
-	__shared__ const char b58digits_ordered[58] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+	// Base58 Lookup Table - use constant memory for better cache performance
+	const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 	const uint8_t *bin = data;
 	int carry;
